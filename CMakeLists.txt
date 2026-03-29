@@ -48,18 +48,6 @@ endif()
 find_package(Threads REQUIRED)
 
 # ==========================================
-# Target 1: Standalone simulation program
-# ==========================================
-add_executable(simulate_bs simulate_bs.cpp helper.cpp)
-
-# Link SEAL, and conditionally link OpenMP
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(simulate_bs SEAL::seal OpenMP::OpenMP_CXX)
-else()
-    target_link_libraries(simulate_bs SEAL::seal)
-endif()
-
-# ==========================================
 # Target 2: Network node program for real environments
 # ==========================================
 add_executable(network_node network_node.cpp helper.cpp)
