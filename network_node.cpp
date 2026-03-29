@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib> 
+#include <iomanip>
 
 using namespace seal;
 using namespace seal::util; 
@@ -194,6 +195,38 @@ void run_server1(int port, uint64_t B_ct, uint64_t t_queries, uint64_t alpha) {
     encryptor.encrypt(p2, base_y);
 
     int num_slots = poly_modulus_degree / 2; // 4096
+
+    cout << "\n================ [Size Profiling] ================" << endl;
+
+    auto print_size = [](string name, size_t bytes) {
+        double kb = bytes / 1024.0;
+        double mb = kb / 1024.0;
+        if (mb > 1.0) 
+            cout << "  - " << left << setw(20) << name << ": " << mb << " MB" << endl;
+        else 
+            cout << "  - " << left << setw(20) << name << ": " << kb << " KB" << endl;
+    };
+
+    // 1. 测量各类密钥大小
+    print_size("SecretKey (sk)", sk.save_size(compr_mode_type::none));
+    print_size("SecretKey Share(sk1)", sk1.save_size(compr_mode_type::none));
+    print_size("PublicKey (pk)", pk.save_size(compr_mode_type::none));
+    print_size("RelinKeys (rlk)", rlk.save_size(compr_mode_type::none));
+
+    // 2. 测量新鲜密文大小
+    print_size("Fresh Ciphertext", base_x.save_size(compr_mode_type::none));
+
+    // 3. 测量做完 1 次乘法并 Rescale 后的密文大小
+    Ciphertext ct_after_mul;
+    evaluator.multiply(base_x, base_y, ct_after_mul);
+    print_size("Ciphertext (size 3)", ct_after_mul.save_size(compr_mode_type::none)); // 乘法后维度膨胀
+
+    evaluator.relinearize_inplace(ct_after_mul, rlk);
+    print_size("Ciphertext (Relin)", ct_after_mul.save_size(compr_mode_type::none));  // 降维回 size 2
+
+    evaluator.rescale_to_next_inplace(ct_after_mul);
+    print_size("Ciphertext (Rescaled)", ct_after_mul.save_size(compr_mode_type::none)); // 消耗一个素数，变小
+    cout << "==================================================\n" << endl;
 
     auto run_benchmark = [&](string name, int num_iters, double expected_result, double tolerance, auto func) {
         cout << "\n[*] Running " << name << " Benchmark..." << endl;
