@@ -28,7 +28,8 @@ void partial_dec(
     uint64_t B_ct = 4096,      
     uint64_t t_queries = 1,      
     uint64_t alpha = 128,
-    bool add_noise = true);
+    bool add_noise = true,
+    bool use_gaussian = false);
 
 void split_secret_key(
     const SEALContext &context,
