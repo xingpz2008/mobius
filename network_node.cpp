@@ -224,7 +224,7 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
     encryptor.encrypt(p2, base_y);
     auto t_enc_end = high_resolution_clock::now();
     double enc_time_ms = duration_cast<nanoseconds>(t_enc_end - t_enc_start).count() / 1e6;
-    cout << "[Metrics] Encryption Time (2 Ciphertexts): " << enc_time_ms << " ms\n" << endl;
+    cout << "[Metrics] Initial Setup Encryption (2 Ciphertexts): " << enc_time_ms << " ms\n" << endl;
 
     int num_slots = poly_modulus_degree / 2;
 
@@ -267,7 +267,7 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
         if (ct_target.parms_id() != ct_ref.parms_id()) {
             evaluator.mod_switch_to_inplace(ct_target, ct_ref.parms_id());
         }
-        ct_target.scale() = ct_ref.scale(); // 强行拉平微小的浮点数 Scale 误差
+        ct_target.scale() = ct_ref.scale(); 
     };
 
     auto run_benchmark = [&](string name, int num_iters, double expected_result, double tolerance, auto func) {
@@ -327,22 +327,56 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
         cout << "  - Amortized Runtime:  " << overall_total_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized Comm(Tx): " << comm_volume_sent_kb / total_data_points << " KB / point" << endl;
         cout << "  - Amortized Comm(Rx): " << comm_volume_recv_kb / total_data_points << " KB / point" << endl;
-        
     };
 
     cout << "\n================ [Microbenchmarks] ================" << endl;
-    Ciphertext ct_test = base_x;
+    // 1. Warm-up Enc & Dec (不计时的纯预热)
+    Ciphertext ct_dummy;
+    encryptor.encrypt(p1, ct_dummy);
+    Plaintext pt_dummy;
+    decryptor.decrypt(ct_dummy, pt_dummy);
+
+    // 2. 测 1 次 Enc 的时间
+    Ciphertext ct_test;
+    auto t_enc_start_micro = high_resolution_clock::now();
+    encryptor.encrypt(p1, ct_test);
+    auto t_enc_end_micro = high_resolution_clock::now();
+    cout << "  - Standard Enc Time:  " << duration_cast<nanoseconds>(t_enc_end_micro - t_enc_start_micro).count() / 1e6 << " ms" << endl;
+
+    // 3. 测 1 次 Dec 的时间
+    Plaintext pt_test_res;
+    auto t_dec_start_micro = high_resolution_clock::now();
+    decryptor.decrypt(ct_test, pt_test_res);
+    auto t_dec_end_micro = high_resolution_clock::now();
+    cout << "  - Standard Dec Time:  " << duration_cast<nanoseconds>(t_dec_end_micro - t_dec_start_micro).count() / 1e6 << " ms" << endl;
+
+    // 4. 测 S1 PartialDec 时间
     Plaintext pt_share;
     auto t_pdec_start = high_resolution_clock::now();
     partial_dec(context, ct_test, sk1, pt_share, B_ct, t_queries, alpha, true, use_gaussian);
     auto t_pdec_end = high_resolution_clock::now();
     cout << "  - S1 PartialDec Time: " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
 
-    Plaintext pt_test_res;
-    auto t_dec_start_micro = high_resolution_clock::now();
-    decryptor.decrypt(ct_test, pt_test_res);
-    auto t_dec_end_micro = high_resolution_clock::now();
-    cout << "  - Standard Dec Time:  " << duration_cast<nanoseconds>(t_dec_end_micro - t_dec_start_micro).count() / 1e6 << " ms" << endl;
+    // 5. 测 Combine (total_dec) 时间
+    Plaintext p0_share, p1_share, combine_res;
+    partial_dec(context, ct_test, sk1, p0_share, B_ct, t_queries, alpha, true, use_gaussian);
+    partial_dec(context, ct_test, sk2, p1_share, B_ct, t_queries, alpha, false, false);
+    auto t_comb_start = high_resolution_clock::now();
+    total_dec(context, ct_test, p0_share, p1_share, combine_res);
+    auto t_comb_end = high_resolution_clock::now();
+    cout << "  - Combine Time:       " << duration_cast<nanoseconds>(t_comb_end - t_comb_start).count() / 1e6 << " ms" << endl;
+
+    // 6. 测单次完整 Refresh Ciphertext 的时间 (包含网络通信)
+    Ciphertext ct_ref_test = ct_test;
+    while (ct_ref_test.coeff_modulus_size() > 2) { // 降维触发自举条件
+        evaluator.mod_switch_to_next_inplace(ct_ref_test);
+    }
+    int dummy_bs_count = 0;
+    double dummy_net_time = 0.0, dummy_pdec_time = 0.0;
+    auto t_ref_start = high_resolution_clock::now();
+    refresh_ciphertext(sock, ct_ref_test, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, dummy_bs_count, dummy_net_time, dummy_pdec_time, use_gaussian);
+    auto t_ref_end = high_resolution_clock::now();
+    cout << "  - Full Refresh Time:  " << duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6 << " ms" << endl;
     cout << "===================================================" << endl;
 
     double expected_sadd = val_x + val_y;
@@ -477,19 +511,17 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
         int div_iterations = 8; 
 
         for (int i = 0; i < div_iterations; i++) {
-            // 计算 w = 2.0 - curr_y
             Plaintext pt_2;
             encoder.encode(2.0, curr_y.scale(), pt_2);
             evaluator.mod_switch_to_inplace(pt_2, curr_y.parms_id());
             
             Ciphertext w;
             evaluator.negate(curr_y, w);
-            evaluator.add_plain_inplace(w, pt_2); // w = 2.0 - y
+            evaluator.add_plain_inplace(w, pt_2); 
             
             Ciphertext next_x;
             Ciphertext curr_x_aligned = curr_x;
             
-            // 确保 x 和 w 对齐
             match_level_and_scale(curr_x_aligned, w);
             evaluator.multiply(curr_x_aligned, w, next_x);
             evaluator.relinearize_inplace(next_x, rlk);
@@ -520,8 +552,7 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
         evaluator.square(ct_sub, ct_res);  
         evaluator.relinearize_inplace(ct_res, rlk);
         evaluator.rescale_to_next_inplace(ct_res);
-        if (ct_res.coeff_modulus_size() <= 2) 
-            refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
     // =========================================================
