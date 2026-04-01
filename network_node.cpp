@@ -349,18 +349,19 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms (Incl. S2 Wait)" << endl;
         cout << "  - Total Comm (Sent):  " << comm_volume_sent_kb << " KB" << endl;
         cout << "  - Total Comm (Recv):  " << comm_volume_recv_kb << " KB" << endl;
-        cout << "  - \033[1;32mTotal Compute:\033[0m      " << computing_cost_s1_ms << " ms" << endl;
-        cout << "  - \033[1;32mTotal Comm:\033[0m         " << comm_volume_sent_kb + comm_volume_recv_kb << " ms" << endl;
-        cout << "  - \033[1;32mTotal Runtime:\033[0m      " << overall_total_ms << " ms" << endl;
+        cout << "  - \033[1;32mTotal Compute:      " << computing_cost_s1_ms << " ms\033[0m" << endl;
+        cout << "  - \033[1;32mTotal Comm:         " << comm_volume_sent_kb + comm_volume_recv_kb << " KB\033[0m" << endl;
+        cout << "  - \033[1;32mTotal Runtime:      " << overall_total_ms << " ms\033[0m" << endl;
         
         cout << "  ---------------- [AMORTIZED COST (Per Item)] ----------------" << endl;
-        cout << "  - Amortized Compute:  " << computing_cost_s1_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized PDec:     " << partial_dec_latency_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized Dec:      " << total_dec_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized Net Wait: " << protocol_latency_ms / total_data_points << " ms / point" << endl;
-        cout << "  - Amortized Runtime:  " << overall_total_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized Comm(Tx): " << comm_volume_sent_kb / total_data_points << " KB / point" << endl;
         cout << "  - Amortized Comm(Rx): " << comm_volume_recv_kb / total_data_points << " KB / point" << endl;
+        cout << "  - \033[1;33mAmortized Compute:  " << computing_cost_s1_ms / total_data_points << " ms / point\033[0m" << endl;
+        cout << "  - \033[1;33mAmortized Comm:     " << (comm_volume_recv_kb + comm_volume_sent_kb) / total_data_points << " KB / point\033[0m" << endl;
+        cout << "  - \033[1;33mAmortized Runtime:  " << overall_total_ms / total_data_points << " ms / point\033[0m" << endl;
         
     };
 
