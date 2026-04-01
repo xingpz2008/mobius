@@ -347,9 +347,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "  - Total S1 PartialDec:" << partial_dec_latency_ms << " ms" << endl;
         cout << "  - Total Decrypt(Dec): " << total_dec_ms << " ms" << endl;
         cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms (Incl. S2 Wait)" << endl;
+        cout << "  - Total Comm (Sent):  " << comm_volume_sent_kb << " KB" << endl;
+        cout << "  - Total Comm (Recv):  " << comm_volume_recv_kb << " KB" << endl;
+        cout << "  - \033[1;32mTotal Compute:\033[0m      " << computing_cost_s1_ms << " ms" << endl;
+        cout << "  - \033[1;32mTotal Comm:\033[0m         " << comm_volume_sent_kb + comm_volume_recv_kb << " ms" << endl;
         cout << "  - \033[1;32mTotal Runtime:\033[0m      " << overall_total_ms << " ms" << endl;
-        cout << "  - \033[1;33mTotal Comm (Sent):\033[0m  " << comm_volume_sent_kb << " KB" << endl;
-        cout << "  - \033[1;33mTotal Comm (Recv):\033[0m  " << comm_volume_recv_kb << " KB" << endl;
         
         cout << "  ---------------- [AMORTIZED COST (Per Item)] ----------------" << endl;
         cout << "  - Amortized Compute:  " << computing_cost_s1_ms / total_data_points << " ms / point" << endl;
