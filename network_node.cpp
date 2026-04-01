@@ -156,13 +156,13 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     network_latency_ms += duration_cast<nanoseconds>(net_end_total - net_start_total).count() / 1e6;
 
     if (s1_is_first_refresh) {
-        cout << "\n  ==== [Server 1] 详细时间分布 (1st Refresh Breakdown) ====" << endl;
-        cout << "    |-- [S1] Noise Gen & Enc u:  " << duration_cast<nanoseconds>(t_noise_end - t_noise_start).count() / 1e6 << " ms" << endl;
-        cout << "    |-- [S1] Partial Decrypt:    " << duration_cast<nanoseconds>(pdec_end - pdec_start).count() / 1e6 << " ms" << endl;
-        cout << "    |-- [S1] 对象序列化(Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
-        cout << "    |-- [S1] Socket 纯发送:      " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
-        cout << "    |-- [S1] Socket 等待+接收:   " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms (这是真正的等待S2计算时间!)" << endl;
-        cout << "    |-- [S1] 对象反序列化(Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
+        cout << "\n  ==== [Server 1] 1st Refresh Breakdown ====" << endl;
+        cout << "    |-- [S1] Noise Gen & Enc u:          " << duration_cast<nanoseconds>(t_noise_end - t_noise_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Partial Decrypt:            " << duration_cast<nanoseconds>(pdec_end - pdec_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Object Serialization (Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Socket Send:                " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Socket Wait + Recv:         " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms (Includes S2 processing time!)" << endl;
+        cout << "    |-- [S1] Object Deserialization (Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
         cout << "  =========================================================" << endl;
         s1_is_first_refresh = false;
     }
@@ -346,7 +346,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "  - Total S1 Compute:   " << computing_cost_s1_ms << " ms" << endl;
         cout << "  - Total S1 PartialDec:" << partial_dec_latency_ms << " ms" << endl;
         cout << "  - Total Decrypt(Dec): " << total_dec_ms << " ms" << endl;
-        cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms (涵盖通信与S2的全部耗时)" << endl;
+        cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms (Incl. S2 Wait)" << endl;
         cout << "  - \033[1;32mTotal Runtime:\033[0m      " << overall_total_ms << " ms" << endl;
         cout << "  - \033[1;33mTotal Comm (Sent):\033[0m  " << comm_volume_sent_kb << " KB" << endl;
         cout << "  - \033[1;33mTotal Comm (Recv):\033[0m  " << comm_volume_recv_kb << " KB" << endl;
@@ -368,7 +368,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     auto t_pdec_start = high_resolution_clock::now();
     partial_dec(context, ct_test, sk1, pt_share, B_ct, t_queries, alpha, true, use_gaussian);
     auto t_pdec_end = high_resolution_clock::now();
-    cout << "  - S1 PartialDec Time (满血密文): " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
+    cout << "  - S1 PartialDec Time (Full Size CT): " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
 
     Plaintext pt_test_res;
     auto t_dec_start_micro = high_resolution_clock::now();
@@ -401,7 +401,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
 
     double full_refresh_ms = duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6;
     
-    cout << "\n  - Full Refresh Time (S1 视角总耗时):  " << full_refresh_ms << " ms" << endl;
+    cout << "\n  - Full Refresh Time (S1 Total):  " << full_refresh_ms << " ms" << endl;
     cout << "    |-- Single Refresh Comm (Sent): " << single_sent_kb << " KB" << endl;
     cout << "    |-- Single Refresh Comm (Recv): " << single_recv_kb << " KB" << endl;
     cout << "===================================================" << endl;
@@ -824,15 +824,15 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             auto t_tx_end = high_resolution_clock::now();
 
             if (is_first_refresh) {
-                cout << "\n  ==== [Server 2] 详细时间分布 (1st Refresh Breakdown) ====" << endl;
-                cout << "    |-- [S2] Socket 纯接收:      " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] 对象反序列化(Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] Partial Decrypt:    " << duration_cast<nanoseconds>(t_pdec_end - t_deser_end).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] Combine Shares:     " << duration_cast<nanoseconds>(t_comb_end - t_pdec_end).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] GMP Mod Lifting:    " << duration_cast<nanoseconds>(t_lift_end - t_comb_end).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] Encrypt & Sub:      " << duration_cast<nanoseconds>(t_enc_end - t_lift_end).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] 对象序列化(Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
-                cout << "    |-- [S2] Socket 纯发送:      " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
+                cout << "\n  ==== [Server 2] 1st Refresh Breakdown ====" << endl;
+                cout << "    |-- [S2] Socket Recv:                " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Object Deserialization (Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Partial Decrypt:            " << duration_cast<nanoseconds>(t_pdec_end - t_deser_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Combine Shares:             " << duration_cast<nanoseconds>(t_comb_end - t_pdec_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] GMP Mod Lifting:            " << duration_cast<nanoseconds>(t_lift_end - t_comb_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Encrypt & Sub:              " << duration_cast<nanoseconds>(t_enc_end - t_lift_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Object Serialization (Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Socket Send:                " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
                 cout << "  =========================================================" << endl;
                 is_first_refresh = false;
             }
