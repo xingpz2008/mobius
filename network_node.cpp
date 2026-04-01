@@ -66,7 +66,7 @@ void recv_seal_object(int sock, const SEALContext& context, T& obj) {
     obj.load(context, ss);
 }
 
-// ========== S1 端：用于在第一次 Refresh 时打印详细的细化 Breakdown ==========
+// ========== Server 1: Used to print detailed breakdown during the 1st Refresh ==========
 static bool s1_is_first_refresh = true;
 
 void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context, 
@@ -127,7 +127,7 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     auto pdec_end = high_resolution_clock::now();
     partial_dec_latency_ms += duration_cast<nanoseconds>(pdec_end - pdec_start).count() / 1e6;
 
-    // === 细化阶段：将序列化、网络发送、网络接收、反序列化 拆开计时 ===
+    // === Refinement phase: Separate timing for serialization, network send, receive, and deserialization ===
     auto net_start_total = high_resolution_clock::now();
 
     auto t_ser_start = high_resolution_clock::now();
@@ -152,7 +152,7 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     auto t_deser_end = high_resolution_clock::now();
 
     auto net_end_total = high_resolution_clock::now();
-    // 依然保持原有的宏观网络延时累加（涵盖从准备发送到解析完成的所有网络交互步骤）
+    // Maintain the original macro network latency accumulation (covering all network steps from preparation to parsing)
     network_latency_ms += duration_cast<nanoseconds>(net_end_total - net_start_total).count() / 1e6;
 
     if (s1_is_first_refresh) {
@@ -171,7 +171,7 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     bootstrap_count++;
 }
 
-void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, bool use_gaussian, uint64_t B_ct, uint64_t t_queries, uint64_t alpha) {
+void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, bool use_gaussian, uint64_t B_ct, uint64_t t_queries, uint64_t alpha, bool only_microbenchmark) {
     cout << "\n[Server 1] Starting up... listening on port " << port << endl;
     cout << "[Server 1] Config -> N: " << poly_modulus_degree << ", Gaussian Noise: " << (use_gaussian ? "ON" : "OFF") << endl;
     
@@ -245,8 +245,17 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     CKKSEncoder encoder(context);
     double scale = pow(2.0, 40);
 
-    double val_x = 1.02;  
-    double val_y = 0.98;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    // val_x can be positive or negative, range set to [-2.0, 2.0]
+    std::uniform_real_distribution<double> dis_x(-2.0, 2.0); 
+    // val_y must be in (0, 2) to ensure Goldschmidt division converges, set to [0.5, 1.5]
+    std::uniform_real_distribution<double> dis_y(0.5, 1.5);  
+
+    double val_x = dis_x(gen);  
+    double val_y = dis_y(gen);
+    
+    cout << "\n[Metrics] Testing with Random Values -> val_x: " << val_x  << ", val_y: " << val_y << endl;
     Plaintext p1, p2;
     encoder.encode(val_x, scale, p1);
     encoder.encode(val_y, scale, p2);
@@ -299,7 +308,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         if (ct_target.parms_id() != ct_ref.parms_id()) {
             evaluator.mod_switch_to_inplace(ct_target, ct_ref.parms_id());
         }
-        ct_target.scale() = ct_ref.scale(); 
+        ct_target.scale() = ct_ref.scale(); // Forcibly level minor floating-point Scale errors
     };
 
     auto run_benchmark = [&](string name, int num_iters, double expected_result, double tolerance, auto func) {
@@ -379,35 +388,78 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     auto t_dec_end_micro = high_resolution_clock::now();
     cout << "  - Standard Dec Time:  " << duration_cast<nanoseconds>(t_dec_end_micro - t_dec_start_micro).count() / 1e6 << " ms" << endl;
     
-    // 6. 测单次完整 Refresh Ciphertext 的时间 (包含网络通信开销)
+    // 6. Measure single Full Refresh Ciphertext time (including network communication overhead)
     Ciphertext ct_ref_test = ct_test;
-    while (ct_ref_test.coeff_modulus_size() > 2) { // 降维触发自举条件
+    while (ct_ref_test.coeff_modulus_size() > 2) { // Drop level to trigger bootstrapping condition
         evaluator.mod_switch_to_next_inplace(ct_ref_test);
     }
     int dummy_bs_count = 0;
     double dummy_net_time = 0.0, dummy_pdec_time = 0.0;
     
-    // 记录刷新前的通信量
+    // Record communication volume before refresh
     size_t before_refresh_sent = bytes_sent;
     size_t before_refresh_recv = bytes_recv;
 
-    // 重新开启首刷打印开关（用于下面的 Refresh）
+    // Re-enable the first-refresh print flag (for the Refresh below)
     s1_is_first_refresh = true;
 
     auto t_ref_start = high_resolution_clock::now();
     refresh_ciphertext(sock, ct_ref_test, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, dummy_bs_count, dummy_net_time, dummy_pdec_time, use_gaussian);
     auto t_ref_end = high_resolution_clock::now();
     
-    // 计算本次产生的通信量
+    // Calculate the communication volume generated this time
     double single_sent_kb = (bytes_sent - before_refresh_sent) / 1024.0;
     double single_recv_kb = (bytes_recv - before_refresh_recv) / 1024.0;
-
     double full_refresh_ms = duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6;
     
     cout << "\n  - Full Refresh Time (S1 Total):  " << full_refresh_ms << " ms" << endl;
     cout << "    |-- Single Refresh Comm (Sent): " << single_sent_kb << " KB" << endl;
     cout << "    |-- Single Refresh Comm (Recv): " << single_recv_kb << " KB" << endl;
+    
+    // 7. Multiply + Refresh Precision Check
+    Ciphertext ct_mul_test;
+    evaluator.multiply(base_x, base_y, ct_mul_test);
+    evaluator.relinearize_inplace(ct_mul_test, rlk);
+    evaluator.rescale_to_next_inplace(ct_mul_test);
+    
+    // Drop level to the bootstrapping trigger line
+    while (ct_mul_test.coeff_modulus_size() > 2) {
+        evaluator.mod_switch_to_next_inplace(ct_mul_test);
+    }
+    
+    refresh_ciphertext(sock, ct_mul_test, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, dummy_bs_count, dummy_net_time, dummy_pdec_time, use_gaussian);
+    
+    Plaintext pt_mul_res;
+    decryptor.decrypt(ct_mul_test, pt_mul_res);
+    vector<double> vec_mul_res;
+    encoder.decode(pt_mul_res, vec_mul_res);
+    
+    double expected_mul_val = val_x * val_y;
+    double max_mul_error = 0.0;
+    double sum_mul_error = 0.0;
+    
+    for (size_t i = 0; i < num_slots; ++i) {
+        double current_err = abs(expected_mul_val - vec_mul_res[i]);
+        if (current_err > max_mul_error) {
+            max_mul_error = current_err;
+        }
+        sum_mul_error += current_err;
+    }
+    double avg_mul_error = sum_mul_error / num_slots;
+
+    cout << "\n  - Mul + Refresh Precision Check: " << endl;
+    cout << "    |-- Expected value: " << expected_mul_val << endl;
+    cout << "    |-- Avg Abs Error:  " << avg_mul_error << " (over " << num_slots << " slots)" << endl;
+    cout << "    |-- Max Abs Error:  " << max_mul_error << endl;
     cout << "===================================================" << endl;
+
+    if (only_microbenchmark) {
+        cout << "\n[Config] 'only_microbenchmark' flag is set. Skipping macrobenchmarks." << endl;
+        send_data(sock, "DONE");
+        close(sock);
+        close(server_fd);
+        return;
+    }
 
     double expected_sadd = val_x + val_y;
     run_benchmark("SADD (Secure Addition)", required_iters, expected_sadd, 0.01, 
@@ -424,9 +476,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    // =========================================================
-    // [Real] SCMP (Minimax Sign Approximation & Step Function)
-    // =========================================================
     double expected_scmp = (val_x > val_y) ? 1.0 : 0.0; 
     run_benchmark("SCMP (Secure Compare)", required_iters, expected_scmp, 0.1, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
@@ -471,9 +520,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         if (ct_res.coeff_modulus_size() <= 2) refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    // =========================================================
-    // [Real] SSBA (Secure Sign Bit-Acquisition)
-    // =========================================================
     double expected_ssba = abs(val_x); 
     run_benchmark("SSBA (Secure Sign & Abs)", required_iters, expected_ssba, 0.1, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
@@ -529,9 +575,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         if (ct_res.coeff_modulus_size() <= 2) refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    // =========================================================
-    // [Real] SDIV (Deep Goldschmidt Division for Bootstrapping)
-    // =========================================================
     double expected_sdiv = val_x / val_y; 
     run_benchmark("SDIV (Deep Goldschmidt Division)", required_iters, expected_sdiv, 0.5, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
@@ -585,9 +628,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    // =========================================================
-    // [Real] SMAX (Secure Maximum via Minimax Routing)
-    // =========================================================
     double expected_real_u = (val_x > val_y) ? 1.0 : 0.0;
     double expected_smax = expected_real_u * (val_x - val_y) + val_y; 
 
@@ -697,7 +737,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
         if (cmd == "REFRESH") {
             auto t_start_s2 = high_resolution_clock::now();
 
-            // === 细化阶段：将网络接收和反序列化拆开 ===
+            // === Refinement phase: Separate network receive and deserialization ===
             auto t_rx_start = high_resolution_clock::now();
             string s_ct_hat = recv_data(sock);
             string s_p0_share = recv_data(sock);
@@ -815,7 +855,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             
             auto t_enc_end = high_resolution_clock::now();
 
-            // === 细化阶段：将 S2 的序列化和发送拆开 ===
+            // === Refinement phase: Separate S2 serialization and send ===
             auto t_ser_start = high_resolution_clock::now();
             stringstream ss_final;
             ct_final.save(ss_final);
@@ -837,7 +877,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
                 cout << "    |-- [S2] Object Serialization (Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
                 cout << "    |-- [S2] Socket Send:                " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
                 cout << "  =========================================================" << endl;
-                is_first_refresh = false;
+                is_first_refresh = false; // Strictly prohibit printing again
             }
         }
     }
@@ -846,7 +886,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        cerr << "Usage for Server 1: " << argv[0] << " 1 [port] [N] [target_data_volume] [use_gaussian(1/0)] [B_ct] [t_queries] [alpha]" << endl;
+        cerr << "Usage for Server 1: " << argv[0] << " 1 [port] [N] [target_data_volume] [use_gaussian(1/0)] [B_ct] [t_queries] [alpha] [only_microbenchmark(1/0)]" << endl;
         cerr << "Usage for Server 2: " << argv[0] << " 2 [ip] [port] [B_ct] [t_queries] [alpha]" << endl;
         return 1;
     }
@@ -865,12 +905,13 @@ int main(int argc, char* argv[]) {
         
         uint64_t default_B_ct = dynamic_B_ct + 500; 
         
-        uint64_t B_ct      = (argc >= 7) ? stoull(argv[6]) : default_B_ct;
+        uint64_t B_ct      = (argc >= 7) ? default_B_ct : default_B_ct;
         uint64_t t_queries = (argc >= 8) ? stoull(argv[7]) : default_t_queries;
         uint64_t alpha     = (argc >= 9) ? stoull(argv[8]) : default_alpha;
+        bool only_microbenchmark = (argc >= 10) ? (atoi(argv[9]) != 0) : false;
         
         cout << "[Config] Dynamically calculated B_ct for N=" << N << " is: " << B_ct << endl;
-        run_server1(port, N, target_data_volume, use_gaussian, B_ct, t_queries, alpha);
+        run_server1(port, N, target_data_volume, use_gaussian, B_ct, t_queries, alpha, only_microbenchmark);
     } 
     else if (role == 2) {
         string ip = (argc >= 3) ? argv[2] : "127.0.0.1";
