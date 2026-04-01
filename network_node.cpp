@@ -138,7 +138,7 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     bootstrap_count++;
 }
 
-void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64_t B_ct, uint64_t t_queries, uint64_t alpha) {
+void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, bool use_gaussian, uint64_t B_ct, uint64_t t_queries, uint64_t alpha) {
     cout << "\n[Server 1] Starting up... listening on port " << port << endl;
     cout << "[Server 1] Config -> N: " << poly_modulus_degree << ", Gaussian Noise: " << (use_gaussian ? "ON" : "OFF") << endl;
     
@@ -224,7 +224,7 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
     encryptor.encrypt(p2, base_y);
     auto t_enc_end = high_resolution_clock::now();
     double enc_time_ms = duration_cast<nanoseconds>(t_enc_end - t_enc_start).count() / 1e6;
-    cout << "[Metrics] Initial Setup Encryption (2 Ciphertexts): " << enc_time_ms << " ms\n" << endl;
+    cout << "[Metrics] Encryption Time (2 Ciphertexts): " << enc_time_ms << " ms\n" << endl;
 
     int num_slots = poly_modulus_degree / 2;
 
@@ -254,7 +254,6 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
     evaluator.rescale_to_next_inplace(ct_after_mul);
     print_size("Ciphertext (Rescaled)", ct_after_mul.save_size(compr_mode_type::none)); 
 
-    long target_data_volume = 1 << 21; 
     int required_iters = std::ceil((double)target_data_volume / num_slots);
 
     cout << "\n================ [Batch Processing Setup] ================" << endl;
@@ -330,53 +329,46 @@ void run_server1(int port, size_t poly_modulus_degree, bool use_gaussian, uint64
     };
 
     cout << "\n================ [Microbenchmarks] ================" << endl;
-    // 1. Warm-up Enc & Dec (不计时的纯预热)
-    Ciphertext ct_dummy;
-    encryptor.encrypt(p1, ct_dummy);
-    Plaintext pt_dummy;
-    decryptor.decrypt(ct_dummy, pt_dummy);
-
-    // 2. 测 1 次 Enc 的时间
-    Ciphertext ct_test;
-    auto t_enc_start_micro = high_resolution_clock::now();
-    encryptor.encrypt(p1, ct_test);
-    auto t_enc_end_micro = high_resolution_clock::now();
-    cout << "  - Standard Enc Time:  " << duration_cast<nanoseconds>(t_enc_end_micro - t_enc_start_micro).count() / 1e6 << " ms" << endl;
-
-    // 3. 测 1 次 Dec 的时间
-    Plaintext pt_test_res;
-    auto t_dec_start_micro = high_resolution_clock::now();
-    decryptor.decrypt(ct_test, pt_test_res);
-    auto t_dec_end_micro = high_resolution_clock::now();
-    cout << "  - Standard Dec Time:  " << duration_cast<nanoseconds>(t_dec_end_micro - t_dec_start_micro).count() / 1e6 << " ms" << endl;
-
-    // 4. 测 S1 PartialDec 时间
+    Ciphertext ct_test = base_x;
     Plaintext pt_share;
     auto t_pdec_start = high_resolution_clock::now();
     partial_dec(context, ct_test, sk1, pt_share, B_ct, t_queries, alpha, true, use_gaussian);
     auto t_pdec_end = high_resolution_clock::now();
     cout << "  - S1 PartialDec Time: " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
 
-    // 5. 测 Combine (total_dec) 时间
-    Plaintext p0_share, p1_share, combine_res;
-    partial_dec(context, ct_test, sk1, p0_share, B_ct, t_queries, alpha, true, use_gaussian);
-    partial_dec(context, ct_test, sk2, p1_share, B_ct, t_queries, alpha, false, false);
-    auto t_comb_start = high_resolution_clock::now();
-    total_dec(context, ct_test, p0_share, p1_share, combine_res);
-    auto t_comb_end = high_resolution_clock::now();
-    cout << "  - Combine Time:       " << duration_cast<nanoseconds>(t_comb_end - t_comb_start).count() / 1e6 << " ms" << endl;
-
-    // 6. 测单次完整 Refresh Ciphertext 的时间 (包含网络通信)
+    Plaintext pt_test_res;
+    auto t_dec_start_micro = high_resolution_clock::now();
+    decryptor.decrypt(ct_test, pt_test_res);
+    auto t_dec_end_micro = high_resolution_clock::now();
+    cout << "  - Standard Dec Time:  " << duration_cast<nanoseconds>(t_dec_end_micro - t_dec_start_micro).count() / 1e6 << " ms" << endl;
+    
+    // 6. 测单次完整 Refresh Ciphertext 的时间 (包含网络通信开销)
     Ciphertext ct_ref_test = ct_test;
     while (ct_ref_test.coeff_modulus_size() > 2) { // 降维触发自举条件
         evaluator.mod_switch_to_next_inplace(ct_ref_test);
     }
     int dummy_bs_count = 0;
     double dummy_net_time = 0.0, dummy_pdec_time = 0.0;
+    
+    // 记录刷新前的通信量
+    size_t before_refresh_sent = bytes_sent;
+    size_t before_refresh_recv = bytes_recv;
+
     auto t_ref_start = high_resolution_clock::now();
     refresh_ciphertext(sock, ct_ref_test, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, dummy_bs_count, dummy_net_time, dummy_pdec_time, use_gaussian);
     auto t_ref_end = high_resolution_clock::now();
-    cout << "  - Full Refresh Time:  " << duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6 << " ms" << endl;
+    
+    // 计算本次产生的通信量
+    double single_sent_kb = (bytes_sent - before_refresh_sent) / 1024.0;
+    double single_recv_kb = (bytes_recv - before_refresh_recv) / 1024.0;
+
+    double full_refresh_ms = duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6;
+    
+    cout << "  - Full Refresh Time:  " << full_refresh_ms << " ms" << endl;
+    cout << "    |-- (Breakdown) S1 PDec Time:   " << dummy_pdec_time << " ms" << endl;
+    cout << "    |-- (Breakdown) Wait S2 + Net:  " << dummy_net_time << " ms (<- 包含S2解密、GMP提升、S2加密和传输)" << endl;
+    cout << "    |-- Single Refresh Comm (Sent): " << single_sent_kb << " KB" << endl;
+    cout << "    |-- Single Refresh Comm (Recv): " << single_recv_kb << " KB" << endl;
     cout << "===================================================" << endl;
 
     double expected_sadd = val_x + val_y;
@@ -656,6 +648,8 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
 
     cout << "\n[Server 2] Waiting for Protocol Commands..." << endl;
 
+    bool is_first_refresh = true; // 用于确保仅在 microbenchmark 中打印一次 S2 的时间分布
+
     while (true) {
         string cmd = recv_data(sock);
         if (cmd == "DONE") {
@@ -663,17 +657,25 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             break;
         }
         if (cmd == "REFRESH") {
+            auto t_start_s2 = high_resolution_clock::now();
+
             Ciphertext ct_hat, ct_u_fresh;
             Plaintext p0_share;
             recv_seal_object(sock, context, ct_hat);
             recv_seal_object(sock, context, p0_share);
             recv_seal_object(sock, context, ct_u_fresh);
 
+            auto t_recv_end = high_resolution_clock::now();
+
             Plaintext p1_share;
             partial_dec(context, ct_hat, sk2, p1_share, B_ct, t_queries, alpha, false, false);
+            
+            auto t_pdec_end = high_resolution_clock::now();
 
             Plaintext plain_masked_ntt;
             total_dec(context, ct_hat, p0_share, p1_share, plain_masked_ntt);
+
+            auto t_comb_end = high_resolution_clock::now();
 
             auto &context_data_low = *context.get_context_data(ct_hat.parms_id());
             auto &context_data_top = *context.first_context_data();
@@ -750,6 +752,8 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             for(size_t j = 0; j < coeff_mod_size_low; j++) mpz_clear(W[j]);
             delete[] W; 
 
+            auto t_lift_end = high_resolution_clock::now();
+
             auto ntt_tables_top = context_data_top.small_ntt_tables();
             RNSIter plain_masked_fresh_iter(plain_masked_fresh.data(), coeff_count);
             ntt_negacyclic_harvey(plain_masked_fresh_iter, coeff_mod_size_top, ntt_tables_top);
@@ -762,8 +766,21 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             ct_masked_fresh.scale() = ct_hat.scale();
             Ciphertext ct_final;
             evaluator.sub(ct_masked_fresh, ct_u_fresh, ct_final);
+            
+            auto t_enc_end = high_resolution_clock::now();
 
             send_seal_object(sock, ct_final);
+
+            if (is_first_refresh) {
+                cout << "\n  ==== [Server 2] Microbenchmark Breakdown (1st Refresh) ====" << endl;
+                cout << "  - [S2] Recv Objects Time: " << duration_cast<nanoseconds>(t_recv_end - t_start_s2).count() / 1e6 << " ms" << endl;
+                cout << "  - [S2] Partial Decrypt:   " << duration_cast<nanoseconds>(t_pdec_end - t_recv_end).count() / 1e6 << " ms" << endl;
+                cout << "  - [S2] Combine Shares:    " << duration_cast<nanoseconds>(t_comb_end - t_pdec_end).count() / 1e6 << " ms" << endl;
+                cout << "  - [S2] GMP Mod Lifting:   " << duration_cast<nanoseconds>(t_lift_end - t_comb_end).count() / 1e6 << " ms" << endl;
+                cout << "  - [S2] Encrypt & Sub:     " << duration_cast<nanoseconds>(t_enc_end - t_lift_end).count() / 1e6 << " ms" << endl;
+                cout << "  ===========================================================" << endl;
+                is_first_refresh = false; // 严禁再次打印
+            }
         }
     }
     close(sock);
@@ -771,7 +788,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        cerr << "Usage for Server 1: " << argv[0] << " 1 [port] [N] [use_gaussian(1/0)] [B_ct] [t_queries] [alpha]" << endl;
+        cerr << "Usage for Server 1: " << argv[0] << " 1 [port] [N] [target_data_volume] [use_gaussian(1/0)] [B_ct] [t_queries] [alpha]" << endl;
         cerr << "Usage for Server 2: " << argv[0] << " 2 [ip] [port] [B_ct] [t_queries] [alpha]" << endl;
         return 1;
     }
@@ -781,20 +798,21 @@ int main(int argc, char* argv[]) {
 
     if (role == 1) {
         int port = (argc >= 3) ? atoi(argv[2]) : 12346;
-        size_t N = (argc >= 4) ? stoull(argv[3]) : 8192;
-        bool use_gaussian = (argc >= 5) ? (atoi(argv[4]) != 0) : true;
+        size_t N = (argc >= 4) ? stoull(argv[3]) : 16384;
+        long target_data_volume = (argc >= 5) ? stoull(argv[4]) : (1 << 21); // <--- 在这里新增强制提取参数
+        bool use_gaussian = (argc >= 6) ? (atoi(argv[5]) != 0) : true;
         
         double seal_sigma = 3.2;
         uint64_t dynamic_B_ct = static_cast<uint64_t>(std::round(6.0 * seal_sigma * std::sqrt(N)));
         
         uint64_t default_B_ct = dynamic_B_ct + 500; 
         
-        uint64_t B_ct      = (argc >= 6) ? stoull(argv[5]) : default_B_ct;
-        uint64_t t_queries = (argc >= 7) ? stoull(argv[6]) : default_t_queries;
-        uint64_t alpha     = (argc >= 8) ? stoull(argv[7]) : default_alpha;
+        uint64_t B_ct      = (argc >= 7) ? stoull(argv[6]) : default_B_ct;
+        uint64_t t_queries = (argc >= 8) ? stoull(argv[7]) : default_t_queries;
+        uint64_t alpha     = (argc >= 9) ? stoull(argv[8]) : default_alpha;
         
         cout << "[Config] Dynamically calculated B_ct for N=" << N << " is: " << B_ct << endl;
-        run_server1(port, N, use_gaussian, B_ct, t_queries, alpha);
+        run_server1(port, N, target_data_volume, use_gaussian, B_ct, t_queries, alpha);
     } 
     else if (role == 2) {
         string ip = (argc >= 3) ? argv[2] : "127.0.0.1";
