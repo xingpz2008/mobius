@@ -66,11 +66,16 @@ void recv_seal_object(int sock, const SEALContext& context, T& obj) {
     obj.load(context, ss);
 }
 
+// ========== S1 端：用于在第一次 Refresh 时打印详细的细化 Breakdown ==========
+static bool s1_is_first_refresh = true;
+
 void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context, 
                         Evaluator &evaluator, Encryptor &encryptor, const SecretKey &sk1, 
                         uint64_t B_ct, uint64_t t_queries, uint64_t alpha, int &bootstrap_count, 
                         double &network_latency_ms, double &partial_dec_latency_ms, bool use_gaussian) { 
     
+    auto t_noise_start = high_resolution_clock::now();
+
     auto &context_data_low = *context.get_context_data(ct_in.parms_id());
     auto &context_data_top = *context.first_context_data();
     size_t coeff_count = context_data_low.parms().poly_modulus_degree();
@@ -114,25 +119,53 @@ void refresh_ciphertext(int sock, Ciphertext &ct_in, const SEALContext &context,
     Ciphertext ct_u_fresh;
     encryptor.encrypt(plain_u_fresh, ct_u_fresh);
 
+    auto t_noise_end = high_resolution_clock::now();
+
     Plaintext p0_share;
-    
     auto pdec_start = high_resolution_clock::now();
     partial_dec(context, ct_hat, sk1, p0_share, B_ct, t_queries, alpha, true, use_gaussian);
     auto pdec_end = high_resolution_clock::now();
     partial_dec_latency_ms += duration_cast<nanoseconds>(pdec_end - pdec_start).count() / 1e6;
 
-    auto net_start = high_resolution_clock::now();
-    
-    send_data(sock, "REFRESH");
-    send_seal_object(sock, ct_hat);
-    send_seal_object(sock, p0_share);
-    send_seal_object(sock, ct_u_fresh);
+    // === 细化阶段：将序列化、网络发送、网络接收、反序列化 拆开计时 ===
+    auto net_start_total = high_resolution_clock::now();
 
+    auto t_ser_start = high_resolution_clock::now();
+    stringstream ss1, ss2, ss3;
+    ct_hat.save(ss1); p0_share.save(ss2); ct_u_fresh.save(ss3);
+    string s_ct_hat = ss1.str(); string s_p0_share = ss2.str(); string s_ct_u_fresh = ss3.str();
+    auto t_ser_end = high_resolution_clock::now();
+
+    auto t_tx_start = high_resolution_clock::now();
+    send_data(sock, "REFRESH");
+    send_data(sock, s_ct_hat); send_data(sock, s_p0_share); send_data(sock, s_ct_u_fresh);
+    auto t_tx_end = high_resolution_clock::now();
+
+    auto t_rx_start = high_resolution_clock::now();
+    string s_ct_final = recv_data(sock);
+    auto t_rx_end = high_resolution_clock::now();
+
+    auto t_deser_start = high_resolution_clock::now();
     Ciphertext ct_final;
-    recv_seal_object(sock, context, ct_final); 
-    
-    auto net_end = high_resolution_clock::now();
-    network_latency_ms += duration_cast<nanoseconds>(net_end - net_start).count() / 1e6;
+    stringstream ss_final(s_ct_final);
+    ct_final.load(context, ss_final);
+    auto t_deser_end = high_resolution_clock::now();
+
+    auto net_end_total = high_resolution_clock::now();
+    // 依然保持原有的宏观网络延时累加（涵盖从准备发送到解析完成的所有网络交互步骤）
+    network_latency_ms += duration_cast<nanoseconds>(net_end_total - net_start_total).count() / 1e6;
+
+    if (s1_is_first_refresh) {
+        cout << "\n  ==== [Server 1] 详细时间分布 (1st Refresh Breakdown) ====" << endl;
+        cout << "    |-- [S1] Noise Gen & Enc u:  " << duration_cast<nanoseconds>(t_noise_end - t_noise_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Partial Decrypt:    " << duration_cast<nanoseconds>(pdec_end - pdec_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] 对象序列化(Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Socket 纯发送:      " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
+        cout << "    |-- [S1] Socket 等待+接收:   " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms (这是真正的等待S2计算时间!)" << endl;
+        cout << "    |-- [S1] 对象反序列化(Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
+        cout << "  =========================================================" << endl;
+        s1_is_first_refresh = false;
+    }
 
     ct_in = ct_final; 
     bootstrap_count++;
@@ -313,7 +346,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "  - Total S1 Compute:   " << computing_cost_s1_ms << " ms" << endl;
         cout << "  - Total S1 PartialDec:" << partial_dec_latency_ms << " ms" << endl;
         cout << "  - Total Decrypt(Dec): " << total_dec_ms << " ms" << endl;
-        cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms" << endl;
+        cout << "  - Total Protocol Wait:" << protocol_latency_ms << " ms (涵盖通信与S2的全部耗时)" << endl;
         cout << "  - \033[1;32mTotal Runtime:\033[0m      " << overall_total_ms << " ms" << endl;
         cout << "  - \033[1;33mTotal Comm (Sent):\033[0m  " << comm_volume_sent_kb << " KB" << endl;
         cout << "  - \033[1;33mTotal Comm (Recv):\033[0m  " << comm_volume_recv_kb << " KB" << endl;
@@ -326,6 +359,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "  - Amortized Runtime:  " << overall_total_ms / total_data_points << " ms / point" << endl;
         cout << "  - Amortized Comm(Tx): " << comm_volume_sent_kb / total_data_points << " KB / point" << endl;
         cout << "  - Amortized Comm(Rx): " << comm_volume_recv_kb / total_data_points << " KB / point" << endl;
+        
     };
 
     cout << "\n================ [Microbenchmarks] ================" << endl;
@@ -334,7 +368,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     auto t_pdec_start = high_resolution_clock::now();
     partial_dec(context, ct_test, sk1, pt_share, B_ct, t_queries, alpha, true, use_gaussian);
     auto t_pdec_end = high_resolution_clock::now();
-    cout << "  - S1 PartialDec Time: " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
+    cout << "  - S1 PartialDec Time (满血密文): " << duration_cast<nanoseconds>(t_pdec_end - t_pdec_start).count() / 1e6 << " ms" << endl;
 
     Plaintext pt_test_res;
     auto t_dec_start_micro = high_resolution_clock::now();
@@ -354,6 +388,9 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     size_t before_refresh_sent = bytes_sent;
     size_t before_refresh_recv = bytes_recv;
 
+    // 重新开启首刷打印开关（用于下面的 Refresh）
+    s1_is_first_refresh = true;
+
     auto t_ref_start = high_resolution_clock::now();
     refresh_ciphertext(sock, ct_ref_test, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, dummy_bs_count, dummy_net_time, dummy_pdec_time, use_gaussian);
     auto t_ref_end = high_resolution_clock::now();
@@ -364,9 +401,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
 
     double full_refresh_ms = duration_cast<nanoseconds>(t_ref_end - t_ref_start).count() / 1e6;
     
-    cout << "  - Full Refresh Time:  " << full_refresh_ms << " ms" << endl;
-    cout << "    |-- (Breakdown) S1 PDec Time:   " << dummy_pdec_time << " ms" << endl;
-    cout << "    |-- (Breakdown) Wait S2 + Net:  " << dummy_net_time << " ms (<- 包含S2解密、GMP提升、S2加密和传输)" << endl;
+    cout << "\n  - Full Refresh Time (S1 视角总耗时):  " << full_refresh_ms << " ms" << endl;
     cout << "    |-- Single Refresh Comm (Sent): " << single_sent_kb << " KB" << endl;
     cout << "    |-- Single Refresh Comm (Recv): " << single_recv_kb << " KB" << endl;
     cout << "===================================================" << endl;
@@ -648,7 +683,7 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
 
     cout << "\n[Server 2] Waiting for Protocol Commands..." << endl;
 
-    bool is_first_refresh = true; // 用于确保仅在 microbenchmark 中打印一次 S2 的时间分布
+    bool is_first_refresh = true; 
 
     while (true) {
         string cmd = recv_data(sock);
@@ -659,13 +694,21 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
         if (cmd == "REFRESH") {
             auto t_start_s2 = high_resolution_clock::now();
 
+            // === 细化阶段：将网络接收和反序列化拆开 ===
+            auto t_rx_start = high_resolution_clock::now();
+            string s_ct_hat = recv_data(sock);
+            string s_p0_share = recv_data(sock);
+            string s_ct_u_fresh = recv_data(sock);
+            auto t_rx_end = high_resolution_clock::now();
+
+            auto t_deser_start = high_resolution_clock::now();
             Ciphertext ct_hat, ct_u_fresh;
             Plaintext p0_share;
-            recv_seal_object(sock, context, ct_hat);
-            recv_seal_object(sock, context, p0_share);
-            recv_seal_object(sock, context, ct_u_fresh);
-
-            auto t_recv_end = high_resolution_clock::now();
+            stringstream ss1(s_ct_hat), ss2(s_p0_share), ss3(s_ct_u_fresh);
+            ct_hat.load(context, ss1);
+            p0_share.load(context, ss2);
+            ct_u_fresh.load(context, ss3);
+            auto t_deser_end = high_resolution_clock::now();
 
             Plaintext p1_share;
             partial_dec(context, ct_hat, sk2, p1_share, B_ct, t_queries, alpha, false, false);
@@ -769,17 +812,29 @@ void run_server2(const string& ip, int port, uint64_t B_ct, uint64_t t_queries, 
             
             auto t_enc_end = high_resolution_clock::now();
 
-            send_seal_object(sock, ct_final);
+            // === 细化阶段：将 S2 的序列化和发送拆开 ===
+            auto t_ser_start = high_resolution_clock::now();
+            stringstream ss_final;
+            ct_final.save(ss_final);
+            string s_ct_final = ss_final.str();
+            auto t_ser_end = high_resolution_clock::now();
+
+            auto t_tx_start = high_resolution_clock::now();
+            send_data(sock, s_ct_final);
+            auto t_tx_end = high_resolution_clock::now();
 
             if (is_first_refresh) {
-                cout << "\n  ==== [Server 2] Microbenchmark Breakdown (1st Refresh) ====" << endl;
-                cout << "  - [S2] Recv Objects Time: " << duration_cast<nanoseconds>(t_recv_end - t_start_s2).count() / 1e6 << " ms" << endl;
-                cout << "  - [S2] Partial Decrypt:   " << duration_cast<nanoseconds>(t_pdec_end - t_recv_end).count() / 1e6 << " ms" << endl;
-                cout << "  - [S2] Combine Shares:    " << duration_cast<nanoseconds>(t_comb_end - t_pdec_end).count() / 1e6 << " ms" << endl;
-                cout << "  - [S2] GMP Mod Lifting:   " << duration_cast<nanoseconds>(t_lift_end - t_comb_end).count() / 1e6 << " ms" << endl;
-                cout << "  - [S2] Encrypt & Sub:     " << duration_cast<nanoseconds>(t_enc_end - t_lift_end).count() / 1e6 << " ms" << endl;
-                cout << "  ===========================================================" << endl;
-                is_first_refresh = false; // 严禁再次打印
+                cout << "\n  ==== [Server 2] 详细时间分布 (1st Refresh Breakdown) ====" << endl;
+                cout << "    |-- [S2] Socket 纯接收:      " << duration_cast<nanoseconds>(t_rx_end - t_rx_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] 对象反序列化(Load): " << duration_cast<nanoseconds>(t_deser_end - t_deser_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Partial Decrypt:    " << duration_cast<nanoseconds>(t_pdec_end - t_deser_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Combine Shares:     " << duration_cast<nanoseconds>(t_comb_end - t_pdec_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] GMP Mod Lifting:    " << duration_cast<nanoseconds>(t_lift_end - t_comb_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Encrypt & Sub:      " << duration_cast<nanoseconds>(t_enc_end - t_lift_end).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] 对象序列化(Save):   " << duration_cast<nanoseconds>(t_ser_end - t_ser_start).count() / 1e6 << " ms" << endl;
+                cout << "    |-- [S2] Socket 纯发送:      " << duration_cast<nanoseconds>(t_tx_end - t_tx_start).count() / 1e6 << " ms" << endl;
+                cout << "  =========================================================" << endl;
+                is_first_refresh = false;
             }
         }
     }
@@ -799,7 +854,7 @@ int main(int argc, char* argv[]) {
     if (role == 1) {
         int port = (argc >= 3) ? atoi(argv[2]) : 12346;
         size_t N = (argc >= 4) ? stoull(argv[3]) : 16384;
-        long target_data_volume = (argc >= 5) ? stoull(argv[4]) : (1 << 21); // <--- 在这里新增强制提取参数
+        long target_data_volume = (argc >= 5) ? (1ULL << stoull(argv[4])) : (1 << 21);
         bool use_gaussian = (argc >= 6) ? (atoi(argv[5]) != 0) : true;
         
         double seal_sigma = 3.2;
