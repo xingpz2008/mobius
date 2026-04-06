@@ -2,3 +2,4 @@
 /.vscode
 simulate_bs.cpp
 *.code-workspace
+approx.py

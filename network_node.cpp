@@ -245,6 +245,8 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     CKKSEncoder encoder(context);
     double scale = pow(2.0, 40);
 
+    int num_slots = poly_modulus_degree / 2;
+
     std::random_device rd;
     std::mt19937 gen(rd());
     // val_x can be positive or negative, range set to [-2.0, 2.0]
@@ -252,10 +254,17 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     // val_y must be in (0, 2) to ensure Goldschmidt division converges, set to [0.5, 1.5]
     std::uniform_real_distribution<double> dis_y(0.5, 1.5);  
 
-    double val_x = dis_x(gen);  
-    double val_y = dis_y(gen);
+    // Vectorize the random numbers to fill all slots
+    vector<double> val_x(num_slots);
+    vector<double> val_y(num_slots);
+    for (int i = 0; i < num_slots; i++) {
+        val_x[i] = dis_x(gen);
+        val_y[i] = dis_y(gen);
+    }
     
-    cout << "\n[Metrics] Testing with Random Values -> val_x: " << val_x  << ", val_y: " << val_y << endl;
+    cout << "\n[Metrics] Testing with " << num_slots << " Different Random Values per Ciphertext" << endl;
+    cout << "  - (e.g., x[0]=" << val_x[0] << ", y[0]=" << val_y[0] << ")" << endl;
+    
     Plaintext p1, p2;
     encoder.encode(val_x, scale, p1);
     encoder.encode(val_y, scale, p2);
@@ -267,8 +276,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     auto t_enc_end = high_resolution_clock::now();
     double enc_time_ms = duration_cast<nanoseconds>(t_enc_end - t_enc_start).count() / 1e6;
     cout << "[Metrics] Encryption Time (2 Ciphertexts): " << enc_time_ms << " ms\n" << endl;
-
-    int num_slots = poly_modulus_degree / 2;
 
     cout << "================ [Size Profiling] ================" << endl;
     auto print_size = [](string name, size_t bytes) {
@@ -311,7 +318,7 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         ct_target.scale() = ct_ref.scale(); // Forcibly level minor floating-point Scale errors
     };
 
-    auto run_benchmark = [&](string name, int num_iters, double expected_result, double tolerance, auto func) {
+    auto run_benchmark = [&](string name, int num_iters, const vector<double>& expected_result, double tolerance, auto func) {
         cout << "\n[*] Running " << name << " Benchmark..." << endl;
         bytes_sent = 0; bytes_recv = 0;
         int bs_count = 0;
@@ -335,8 +342,15 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
 
         vector<double> vec_res;
         encoder.decode(pt_res, vec_res);
-        double actual_result = vec_res[0];
-        double error = abs(expected_result - actual_result);
+        
+        double max_error = 0.0;
+        double sum_error = 0.0;
+        for (size_t i = 0; i < num_slots; ++i) {
+            double err = abs(expected_result[i] - vec_res[i]);
+            if (err > max_error) max_error = err;
+            sum_error += err;
+        }
+        double avg_error = sum_error / num_slots;
 
         double total_runtime_ms = duration_cast<nanoseconds>(t_end - t_start).count() / 1e6;
         double computing_cost_s1_ms = total_runtime_ms - protocol_latency_ms; 
@@ -350,6 +364,10 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         cout << "[Metrics] ======== " << name << " ========" << endl;
         cout << "  - Config:             " << num_iters << " iterations x " << num_slots << " slots = " << total_data_points << " points" << endl;
         
+        cout << "  ---- [ACCURACY CHECK] ----" << endl;
+        cout << "  - \033[1;36mAvg Abs Error:      " << avg_error << " (over " << num_slots << " slots)\033[0m" << endl;
+        cout << "  - \033[1;36mMax Abs Error:      " << max_error << "\033[0m" << endl;
+
         cout << "  ---- [TOTAL COST FOR " << target_data_volume << " POINTS] ----" << endl;
         cout << "  - Total Bootstraps:   " << bs_count << " times" << endl;
         cout << "  - Total S1 Compute:   " << computing_cost_s1_ms << " ms" << endl;
@@ -434,11 +452,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     vector<double> vec_mul_res;
     encoder.decode(pt_mul_res, vec_mul_res);
     
-    double expected_mul_val = val_x * val_y;
     double max_mul_error = 0.0;
     double sum_mul_error = 0.0;
     
     for (size_t i = 0; i < num_slots; ++i) {
+        double expected_mul_val = val_x[i] * val_y[i];
         double current_err = abs(expected_mul_val - vec_mul_res[i]);
         if (current_err > max_mul_error) {
             max_mul_error = current_err;
@@ -448,7 +466,6 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
     double avg_mul_error = sum_mul_error / num_slots;
 
     cout << "\n  - Mul + Refresh Precision Check: " << endl;
-    cout << "    |-- Expected value: " << expected_mul_val << endl;
     cout << "    |-- Avg Abs Error:  " << avg_mul_error << " (over " << num_slots << " slots)" << endl;
     cout << "    |-- Max Abs Error:  " << max_mul_error << endl;
     cout << "===================================================" << endl;
@@ -461,13 +478,79 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         return;
     }
 
-    double expected_sadd = val_x + val_y;
+    // =========================================================
+    // [NEW] SRELU (Secure ReLU Function via Customized Minimax)
+    // =========================================================
+    vector<double> expected_srelu(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_srelu[i] = (val_x[i] > 0) ? val_x[i] : 0.0;
+
+    run_benchmark("SRELU (Secure ReLU)", required_iters, expected_srelu, 0.1, 
+    [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
+        
+        // 1. Calculate odd powers of x
+        Ciphertext z2, z3, z5, z7, x_down1 = ct_x;
+        evaluator.square(ct_x, z2); evaluator.relinearize_inplace(z2, rlk); evaluator.rescale_to_next_inplace(z2);
+        if (z2.coeff_modulus_size() <= 2) refresh_ciphertext(sock, z2, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        match_level_and_scale(x_down1, z2);
+        evaluator.multiply(z2, x_down1, z3); evaluator.relinearize_inplace(z3, rlk); evaluator.rescale_to_next_inplace(z3);
+        if (z3.coeff_modulus_size() <= 2) refresh_ciphertext(sock, z3, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        Ciphertext z2_down1 = z2; match_level_and_scale(z2_down1, z3);
+        evaluator.multiply(z3, z2_down1, z5); evaluator.relinearize_inplace(z5, rlk); evaluator.rescale_to_next_inplace(z5);
+        if (z5.coeff_modulus_size() <= 2) refresh_ciphertext(sock, z5, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        Ciphertext z2_down2 = z2; match_level_and_scale(z2_down2, z5);
+        evaluator.multiply(z5, z2_down2, z7); evaluator.relinearize_inplace(z7, rlk); evaluator.rescale_to_next_inplace(z7);
+        if (z7.coeff_modulus_size() <= 2) refresh_ciphertext(sock, z7, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        auto multiply_coeff = [&](Ciphertext ct, double coeff) {
+            Plaintext pt; encoder.encode(coeff, ct.scale(), pt); evaluator.mod_switch_to_inplace(pt, ct.parms_id());
+            Ciphertext res; evaluator.multiply_plain(ct, pt, res); evaluator.rescale_to_next_inplace(res); return res;
+        };
+
+        // 2. Apply Custom Minimax Coefficients for sign(x) over [-4, 4]
+        Ciphertext t1 = multiply_coeff(ct_x, 1.31274143);
+        Ciphertext t3 = multiply_coeff(z3, -0.29478856);
+        Ciphertext t5 = multiply_coeff(z5, 0.02848971);
+        Ciphertext t7 = multiply_coeff(z7, -0.00090401);
+        match_level_and_scale(t1, t7); match_level_and_scale(t3, t7); match_level_and_scale(t5, t7);
+
+        Ciphertext sign_x;
+        evaluator.add(t1, t3, sign_x); evaluator.add_inplace(sign_x, t5); evaluator.add_inplace(sign_x, t7);
+        if (sign_x.coeff_modulus_size() <= 2) refresh_ciphertext(sock, sign_x, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        // 3. Compute ReLU(x) = 0.5 * sign(x) * x + 0.5 * x
+        Plaintext pt_half; encoder.encode(0.5, sign_x.scale(), pt_half); evaluator.mod_switch_to_inplace(pt_half, sign_x.parms_id());
+        Ciphertext half_sign_x; evaluator.multiply_plain(sign_x, pt_half, half_sign_x); evaluator.rescale_to_next_inplace(half_sign_x); 
+        if (half_sign_x.coeff_modulus_size() <= 2) refresh_ciphertext(sock, half_sign_x, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+        
+        Ciphertext x_down_final = ct_x;
+        match_level_and_scale(x_down_final, half_sign_x);
+        
+        Ciphertext term1;
+        evaluator.multiply(half_sign_x, x_down_final, term1); // 0.5 * sign(x) * x
+        evaluator.relinearize_inplace(term1, rlk);
+        evaluator.rescale_to_next_inplace(term1);
+        if (term1.coeff_modulus_size() <= 2) refresh_ciphertext(sock, term1, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
+
+        Plaintext pt_half2; encoder.encode(0.5, ct_x.scale(), pt_half2); 
+        evaluator.mod_switch_to_inplace(pt_half2, ct_x.parms_id());
+        Ciphertext term2; evaluator.multiply_plain(ct_x, pt_half2, term2); evaluator.rescale_to_next_inplace(term2); // 0.5 * x
+
+        match_level_and_scale(term2, term1);
+        evaluator.add(term1, term2, ct_res);
+    });
+
+    vector<double> expected_sadd(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_sadd[i] = val_x[i] + val_y[i];
     run_benchmark("SADD (Secure Addition)", required_iters, expected_sadd, 0.01, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         evaluator.add(ct_x, ct_y, ct_res);
     });
 
-    double expected_smul = val_x * val_y;
+    vector<double> expected_smul(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_smul[i] = val_x[i] * val_y[i];
     run_benchmark("SMUL (Secure Multiply)", required_iters, expected_smul, 0.01, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         evaluator.multiply(ct_x, ct_y, ct_res);
@@ -476,7 +559,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    double expected_scmp = (val_x > val_y) ? 1.0 : 0.0; 
+    // =========================================================
+    // [Real] SCMP (Minimax Sign Approximation & Step Function)
+    // =========================================================
+    vector<double> expected_scmp(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_scmp[i] = (val_x[i] > val_y[i]) ? 1.0 : 0.0;
     run_benchmark("SCMP (Secure Compare)", required_iters, expected_scmp, 0.1, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         Ciphertext ct_z;
@@ -520,7 +607,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         if (ct_res.coeff_modulus_size() <= 2) refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    double expected_ssba = abs(val_x); 
+    // =========================================================
+    // [Real] SSBA (Secure Sign Bit-Acquisition)
+    // =========================================================
+    vector<double> expected_ssba(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_ssba[i] = abs(val_x[i]);
     run_benchmark("SSBA (Secure Sign & Abs)", required_iters, expected_ssba, 0.1, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         Ciphertext z2, z3, z5, z7, z_down1 = ct_x;
@@ -575,7 +666,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         if (ct_res.coeff_modulus_size() <= 2) refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    double expected_sdiv = val_x / val_y; 
+    // =========================================================
+    // [Real] SDIV (Deep Goldschmidt Division for Bootstrapping)
+    // =========================================================
+    vector<double> expected_sdiv(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_sdiv[i] = val_x[i] / val_y[i];
     run_benchmark("SDIV (Deep Goldschmidt Division)", required_iters, expected_sdiv, 0.5, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         Ciphertext curr_x = ct_x;
@@ -616,7 +711,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         ct_res = curr_x; 
     });
 
-    double expected_sed = pow(val_x - val_y, 2);
+    // =========================================================
+    // [Real] SED (Secure Euclidean Distance)
+    // =========================================================
+    vector<double> expected_sed(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_sed[i] = pow(val_x[i] - val_y[i], 2);
     run_benchmark("SED (Secure Euclidean Distance)", required_iters, expected_sed, 0.01, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         Ciphertext ct_sub;
@@ -628,9 +727,11 @@ void run_server1(int port, size_t poly_modulus_degree, long target_data_volume, 
         refresh_ciphertext(sock, ct_res, context, evaluator, encryptor, sk1, B_ct, t_queries, alpha, bs_count, net_time, pdec_time, use_gaussian);
     });
 
-    double expected_real_u = (val_x > val_y) ? 1.0 : 0.0;
-    double expected_smax = expected_real_u * (val_x - val_y) + val_y; 
-
+    // =========================================================
+    // [Real] SMAX (Secure Maximum via Minimax Routing)
+    // =========================================================
+    vector<double> expected_smax(num_slots);
+    for(int i = 0; i < num_slots; i++) expected_smax[i] = (val_x[i] > val_y[i] ? 1.0 : 0.0) * (val_x[i] - val_y[i]) + val_y[i];
     run_benchmark("SMAX (Secure Max)", required_iters, expected_smax, 0.1, 
     [&](Ciphertext &ct_x, Ciphertext &ct_y, int &bs_count, Ciphertext &ct_res, double &net_time, double &pdec_time) {
         Ciphertext ct_sub;
@@ -905,7 +1006,7 @@ int main(int argc, char* argv[]) {
         
         uint64_t default_B_ct = dynamic_B_ct + 500; 
         
-        uint64_t B_ct      = (argc >= 7) ? default_B_ct : default_B_ct;
+        uint64_t B_ct      = (argc >= 7) ? stoull(argv[6]) : default_B_ct;
         uint64_t t_queries = (argc >= 8) ? stoull(argv[7]) : default_t_queries;
         uint64_t alpha     = (argc >= 9) ? stoull(argv[8]) : default_alpha;
         bool only_microbenchmark = (argc >= 10) ? (atoi(argv[9]) != 0) : false;
